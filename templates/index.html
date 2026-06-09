@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>企业售后智能体演示</title>
+  <style>
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f8fb; color: #1f2937; }
+    .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+    .grid { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 20px; }
+    .card { background: #fff; border-radius: 16px; box-shadow: 0 8px 30px rgba(15, 23, 42, 0.06); padding: 20px; }
+    .title { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+    .sub { color: #6b7280; margin-bottom: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    input, textarea, button, select { font: inherit; }
+    textarea, input, select { width: 100%; border: 1px solid #d1d5db; border-radius: 12px; padding: 12px; box-sizing: border-box; }
+    textarea { min-height: 120px; resize: vertical; }
+    button { border: 0; border-radius: 12px; padding: 12px 16px; background: linear-gradient(135deg, #2563eb, #7c3aed); color: #fff; cursor: pointer; font-weight: 600; }
+    button.secondary { background: #e5e7eb; color: #111827; }
+    .list { display: grid; gap: 10px; margin-top: 12px; }
+    .item { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; background: #fafafa; }
+    .chat-box { height: 420px; overflow: auto; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; background: #fcfcfd; }
+    .msg { margin-bottom: 10px; }
+    .msg .role { font-size: 12px; color: #6b7280; margin-bottom: 2px; }
+    .msg .bubble { padding: 10px 12px; border-radius: 12px; display: inline-block; max-width: 90%; white-space: pre-wrap; word-break: break-word; }
+    .user .bubble { background: #dbeafe; }
+    .assistant .bubble { background: #ede9fe; }
+    .meta { font-size: 12px; color: #6b7280; margin-top: 8px; white-space: pre-wrap; }
+    .section-title { font-size: 18px; font-weight: 700; margin: 0 0 12px; }
+    .small { font-size: 12px; color: #6b7280; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef2ff; color: #4338ca; font-size: 12px; margin-right: 6px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="title">企业售后智能体演示平台</div>
+  <div class="sub">支持政策上传、规则抽取、路由提示、function calling 多轮调用、SSE 流式输出与知识检索。</div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="section-title">上传政策文件</div>
+      <form id="uploadForm">
+        <input id="policyFile" type="file" name="file" accept=".txt,.md,.json" />
+        <div class="row" style="margin-top: 12px;">
+          <button type="submit">上传并解析</button>
+          <button type="button" class="secondary" onclick="refreshPolicies()">刷新政策列表</button>
+        </div>
+      </form>
+      <div class="meta" id="uploadResult"></div>
+
+      <div style="margin-top: 20px;">
+        <div class="section-title">政策列表</div>
+        <div id="policyList" class="list"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">消息问答</div>
+      <div class="row" style="margin-bottom: 12px;">
+        <input id="sessionId" placeholder="session_id（可留空自动生成）" />
+        <select id="policyId"></select>
+      </div>
+      <div class="row" style="margin-bottom: 12px;">
+        <button type="button" class="secondary" onclick="sendMessage(true)">SSE 流式发送</button>
+        <button type="button" class="secondary" onclick="clearChat()">清空</button>
+      </div>
+      <div id="chatBox" class="chat-box"></div>
+      <div style="margin-top: 12px;">
+        <textarea id="message" placeholder="输入售后问题，例如：我是U1001，订单888还能退吗？"></textarea>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <button onclick="sendMessage(false)">发送</button>
+      </div>
+      <div class="meta" id="chatMeta"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let eventSource = null;
+
+  async function refreshPolicies() {
+    const res = await fetch('/api/policies');
+    const data = await res.json();
+    const list = document.getElementById('policyList');
+    const select = document.getElementById('policyId');
+    list.innerHTML = '';
+    select.innerHTML = '<option value="">默认最新政策</option>';
+    (data.policies || []).forEach(p => {
+      const div = document.createElement('div');
+      div.className = 'item';
+      div.innerHTML = `<b>${p.file_name}</b><br/><span class="small">${p.policy_id}</span><br/><span class="small">${p.created_at}</span><br/><span class="pill">规则数: ${((p.rule_set && p.rule_set.policies) || []).length || '未知'}</span>`;
+      list.appendChild(div);
+
+      const option = document.createElement('option');
+      option.value = p.policy_id;
+      option.textContent = `${p.file_name} (${p.policy_id})`;
+      select.appendChild(option);
+    });
+  }
+
+  document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fileInput = document.getElementById('policyFile');
+    if (!fileInput.files.length) return;
+    const fd = new FormData();
+    fd.append('file', fileInput.files[0]);
+    const res = await fetch('/api/policies/upload', { method: 'POST', body: fd });
+    const data = await res.json();
+    document.getElementById('uploadResult').textContent = data.ok ? `上传成功：${data.policy_id}，规则数：${data.rule_count}` : '上传失败';
+    await refreshPolicies();
+  });
+
+  function appendMessage(role, content) {
+    const box = document.getElementById('chatBox');
+    const wrap = document.createElement('div');
+    wrap.className = `msg ${role}`;
+    wrap.innerHTML = `<div class="role">${role}</div><div class="bubble"></div>`;
+    wrap.querySelector('.bubble').textContent = content;
+    box.appendChild(wrap);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function sendMessage(useStream) {
+    const message = document.getElementById('message').value.trim();
+    const sessionInput = document.getElementById('sessionId').value.trim();
+    const policyId = document.getElementById('policyId').value;
+    if (!message) return;
+    appendMessage('user', message);
+    document.getElementById('message').value = '';
+
+    if (useStream) {
+      if (eventSource) eventSource.close();
+      const params = new URLSearchParams({ message, policy_id: policyId || '', session_id: sessionInput || '' });
+      eventSource = new EventSource(`/api/chat/stream?${params.toString()}`);
+      let meta = {};
+      eventSource.addEventListener('route', (e) => {
+        meta.route = JSON.parse(e.data);
+        document.getElementById('chatMeta').textContent = `route_hint=${JSON.stringify(meta.route, null, 2)}`;
+      });
+      eventSource.addEventListener('policy', (e) => {
+        meta.policy = JSON.parse(e.data);
+        document.getElementById('chatMeta').textContent = `route_hint=${JSON.stringify(meta.route || {}, null, 2)}\n\npolicy_context=${meta.policy.policy_context || ''}\n\npolicy_fragment=${meta.policy.policy_fragment || ''}`;
+      });
+      eventSource.addEventListener('tool_trace', (e) => {
+        meta.tool_trace = JSON.parse(e.data);
+        document.getElementById('chatMeta').textContent += `\n\nstate=${meta.tool_trace.state || ''}\n\ntool_rounds=${meta.tool_trace.tool_rounds || 0}\n\ntool_bundle=${JSON.stringify(meta.tool_trace.bundle, null, 2)}\n\nreact_trace=${JSON.stringify(meta.tool_trace.react_trace || [], null, 2)}`;
+      });
+      eventSource.addEventListener('message', (e) => {
+        const data = JSON.parse(e.data);
+        document.getElementById('sessionId').value = data.session_id;
+        appendMessage('assistant', data.answer || '');
+      });
+      eventSource.addEventListener('done', () => {
+        eventSource.close();
+      });
+      return;
+    }
+
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, session_id: sessionInput || null, policy_id: policyId || null })
+    });
+    const data = await res.json();
+    document.getElementById('sessionId').value = data.session_id;
+    appendMessage('assistant', data.answer || '');
+    document.getElementById('chatMeta').textContent = `route_hint=${JSON.stringify(data.route, null, 2)}\n\npolicy_context=${data.tool_trace.policy_context || ''}\n\npolicy_fragment=${data.tool_trace.policy_fragment || ''}\n\nstate=${data.tool_trace.state || ''}\n\ntool_rounds=${data.tool_trace.tool_rounds || 0}\n\ntool_bundle=${JSON.stringify(data.tool_trace.bundle, null, 2)}\n\nreact_trace=${JSON.stringify(data.tool_trace.react_trace || [], null, 2)}`;
+  }
+
+  function clearChat() {
+    document.getElementById('chatBox').innerHTML = '';
+    document.getElementById('chatMeta').textContent = '';
+  }
+
+  refreshPolicies();
+</script>
+</body>
+</html>
