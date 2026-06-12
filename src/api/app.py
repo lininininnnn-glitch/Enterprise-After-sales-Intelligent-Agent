@@ -17,7 +17,10 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 
 from src.agent.agent import OmniAgent
+from src.agent.orchestrator import LLMFirstOrchestrator
 from src.agent.router import ASRouter, RouterContext
+from src.agent.workflow import AfterSalesWorkflow
+from src.policy.ingestion import build_ingestion_plan
 from src.policy.policy_loader import PolicyRuleSet, load_and_extract_policy_rules
 from src.policy.policy_store import PolicyStore
 
@@ -42,6 +45,9 @@ class ChatResponse(BaseModel):
     session_id: str
     policy_id: Optional[str]
     route: dict[str, Any]
+    extraction: dict[str, Any]
+    retrieval: Optional[dict[str, Any]]
+    graph_result: Optional[dict[str, Any]]
     tool_trace: dict[str, Any]
     answer: str
 
@@ -112,9 +118,10 @@ async def upload_policy(file: UploadFile = File(...)) -> JSONResponse:
     content = await file.read()
     save_path.write_bytes(content)
 
+    plan = build_ingestion_plan(save_path)
     rule_set = load_and_extract_policy_rules(save_path)
     record = policy_store.register(file_name=file.filename, rule_set=rule_set, source_path=str(save_path))
-    return JSONResponse({"ok": True, "policy_id": record.policy_id, "file_name": record.file_name, "created_at": record.created_at, "rule_count": len(rule_set.policies), "rule_set": rule_set.to_dict()})
+    return JSONResponse({"ok": True, "policy_id": record.policy_id, "file_name": record.file_name, "created_at": record.created_at, "rule_count": len(rule_set.policies), "rule_set": rule_set.to_dict(), "ingestion_plan": plan.__dict__})
 
 
 @app.get("/api/policies/{policy_id}")
@@ -131,21 +138,32 @@ def chat(payload: ChatRequest) -> ChatResponse:
     policy_record, policy_rules = _resolve_policy_rules(payload.policy_id)
     session_id = payload.session_id or uuid4().hex[:12]
     agent = _get_agent(session_id, policy_rules=policy_rules)
-    run_result = agent.run(payload.message)
-    answer = run_result.answer
-
-    router = ASRouter(policy_rules=policy_rules)
-    route = router.route(RouterContext(user_input=payload.message, policy_rules=policy_rules))
+    orchestrator = LLMFirstOrchestrator(agent)
+    result = orchestrator.run(payload.message)
+    route = result.route
     tool_trace = {
         "route": route.__dict__,
         "policy_context": route.context_hint,
         "policy_fragment": route.matched_policy_description,
-        "bundle": run_result.tool_bundle.to_dict(),
-        "state": run_result.state.value,
-        "tool_rounds": run_result.tool_rounds,
-        "react_trace": [item.to_dict() for item in run_result.trace],
+        "bundle": result.agent_result.tool_bundle.to_dict(),
+        "state": result.agent_result.state.value,
+        "tool_rounds": result.agent_result.tool_rounds,
+        "react_trace": [item.to_dict() for item in result.agent_result.trace],
+        "extraction": result.extraction.to_dict(),
+        "retrieval": result.retrieval.to_dict() if result.retrieval else None,
+        "graph_result": result.graph_result.to_dict() if result.graph_result else None,
+        "needs_human": result.needs_human,
     }
-    return ChatResponse(session_id=session_id, policy_id=policy_record.policy_id if policy_record else None, route=route.__dict__, tool_trace=tool_trace, answer=answer)
+    return ChatResponse(
+        session_id=session_id,
+        policy_id=policy_record.policy_id if policy_record else None,
+        route=route.__dict__,
+        extraction=result.extraction.to_dict(),
+        retrieval=result.retrieval.to_dict() if result.retrieval else None,
+        graph_result=result.graph_result.to_dict() if result.graph_result else None,
+        tool_trace=tool_trace,
+        answer=result.answer,
+    )
 
 
 @app.get("/api/chat/stream")
@@ -153,15 +171,20 @@ def chat_stream(message: str, policy_id: Optional[str] = None, session_id: Optio
     policy_record, policy_rules = _resolve_policy_rules(policy_id)
     real_session_id = session_id or uuid4().hex[:12]
     agent = _get_agent(real_session_id, policy_rules=policy_rules)
-    router = ASRouter(policy_rules=policy_rules)
-    route = router.route(RouterContext(user_input=message, policy_rules=policy_rules))
+    workflow = AfterSalesWorkflow(agent)
+    route = workflow.router.route(RouterContext(user_input=message, policy_rules=policy_rules))
 
     def event_stream():
         yield f"event: route\ndata: {json.dumps(route.__dict__, ensure_ascii=False)}\n\n"
         yield f"event: policy\ndata: {json.dumps({'policy_id': policy_record.policy_id if policy_record else None, 'policy_context': route.context_hint, 'policy_fragment': route.matched_policy_description}, ensure_ascii=False)}\n\n"
-        run_result = agent.run(message)
-        yield f"event: tool_trace\ndata: {json.dumps({'bundle': run_result.tool_bundle.to_dict(), 'state': run_result.state.value, 'tool_rounds': run_result.tool_rounds, 'react_trace': [item.to_dict() for item in run_result.trace]}, ensure_ascii=False)}\n\n"
-        yield f"event: message\ndata: {json.dumps({'session_id': real_session_id, 'policy_id': policy_record.policy_id if policy_record else None, 'answer': run_result.answer}, ensure_ascii=False)}\n\n"
+        result = workflow.run(message)
+        yield f"event: extraction\ndata: {json.dumps(result.extraction.to_dict(), ensure_ascii=False)}\n\n"
+        yield f"event: retrieval\ndata: {json.dumps(result.retrieval.to_dict() if result.retrieval else None, ensure_ascii=False)}\n\n"
+        yield f"event: tool_trace\ndata: {json.dumps({'bundle': result.agent_result.tool_bundle.to_dict(), 'state': result.agent_result.state.value, 'tool_rounds': result.agent_result.tool_rounds, 'react_trace': [item.to_dict() for item in result.agent_result.trace]}, ensure_ascii=False)}\n\n"
+        final_answer = result.agent_result.answer
+        if result.meta.get("answer_prefix"):
+            final_answer = result.meta["answer_prefix"] + final_answer
+        yield f"event: message\ndata: {json.dumps({'session_id': real_session_id, 'policy_id': policy_record.policy_id if policy_record else None, 'answer': final_answer}, ensure_ascii=False)}\n\n"
         yield "event: done\ndata: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

@@ -22,11 +22,13 @@ from openai import OpenAI
 
 from src.policy.policy_loader import PolicyRuleSet
 from src.agent.router import ASRouter, RouteDecision, RouterContext
+from src.agent.validator import build_fix_prompt, validate_answer
 from src.tools.tools import TOOL_INPUT_MODELS, TOOL_REGISTRY, TOOL_SPECS
 
 SYSTEM_PROMPT = (
     "你是一个严谨、专业的企业售后智能助理。"
     "你必须优先使用工具获取事实，不要凭空编造订单、会员或政策信息。"
+    "你需要遵循 ReAct 风格：先分析是否需要抽取、检索、图谱或工具调用，再回答。"
     "当信息不足时，继续调用合适的工具；如果仍然不足，需要明确说明。"
 )
 
@@ -150,6 +152,7 @@ class OmniAgent:
         }
         return (
             "你是一个企业售后智能助理。下面提供的是路由提示、政策片段和系统已获取的事实信息。\n"
+            "请按如下步骤工作：1）识别是否需要结构化抽取；2）必要时调用检索或图谱工具；3）必要时调用业务工具；4）基于工具结果生成最终回答。\n"
             "路由提示只供参考，不替代你的判断。请你通过 function calling 自主决定是否查询用户、订单、会员权益、知识库或知识图谱。\n"
             "如果事实不足，请继续调用工具；如果信息足够，请直接生成最终售后回复。\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
@@ -168,7 +171,19 @@ class OmniAgent:
     def _merge_assistant_message(self, assistant_message: Any) -> None:
         message: Dict[str, Any] = {"role": "assistant", "content": assistant_message.content or ""}
         if assistant_message.tool_calls:
-            message["tool_calls"] = assistant_message.tool_calls
+            normalized_calls = []
+            for call in assistant_message.tool_calls:
+                normalized_calls.append(
+                    {
+                        "id": getattr(call, "id", None),
+                        "type": getattr(call, "type", "function"),
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                )
+            message["tool_calls"] = normalized_calls
         self.messages.append(message)
         self._trim_history()
 
@@ -186,7 +201,8 @@ class OmniAgent:
             payload = {"tool_name": tool_name, "arguments": arguments_dict, "result": result}
         except Exception as exc:
             payload = {"tool_name": tool_name, "arguments": raw_arguments, "result": {"error": str(exc)}}
-        return {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(payload, ensure_ascii=False)}, payload
+        tool_message = {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(payload, ensure_ascii=False)}
+        return tool_message, payload
 
     def _build_tool_bundle_from_recent_tools(self) -> ToolBundle:
         bundle = ToolBundle()
@@ -213,7 +229,16 @@ class OmniAgent:
                 bundle.graph_result = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         return bundle
 
-    def run(self, user_input: str, max_tool_rounds: int = 4) -> AgentRunResult:
+    def _should_force_tool_round(self, decision: RouteDecision, bundle: ToolBundle, user_input: str) -> bool:
+        if decision.intent == "structured_extraction" and not bundle.order_info:
+            return True
+        if any(keyword in user_input for keyword in ("退款", "退货", "换货", "保修", "维修", "发票")) and not bundle.policy_search:
+            return True
+        if decision.needs_graph and not bundle.graph_result:
+            return True
+        return False
+
+    def run(self, user_input: str, max_tool_rounds: int = 4, max_answer_retries: int = 3) -> AgentRunResult:
         trace: list[ReActTraceStep] = []
         step = 1
         state = AgentState.INIT
@@ -235,9 +260,20 @@ class OmniAgent:
         self._merge_assistant_message(assistant_message)
 
         tool_rounds = 0
-        while assistant_message.tool_calls and tool_rounds < max_tool_rounds:
+        bundle = self._build_tool_bundle_from_recent_tools()
+        while (assistant_message.tool_calls or self._should_force_tool_round(decision, bundle, user_input)) and tool_rounds < max_tool_rounds:
             tool_rounds += 1
             state = AgentState.TOOL_RUNNING
+            if not assistant_message.tool_calls:
+                suggested_tools = decision.suggested_tools or ["search_company_policy"]
+                assistant_message.tool_calls = []
+                for idx, tool_name in enumerate(suggested_tools[:2], start=1):
+                    fake_call = type("FakeToolCall", (), {})()
+                    fake_call.id = f"forced_{tool_rounds}_{idx}"
+                    fake_call.function = type("FakeFunction", (), {})()
+                    fake_call.function.name = tool_name
+                    fake_call.function.arguments = json.dumps({"query": user_input, "entity_name": user_input, "order_id": self._extract_order_id(user_input) or "", "reason": user_input, "user_id": self._extract_user_id(user_input) or "", "vip_level": self._extract_vip_level(user_input) or "普通用户"}, ensure_ascii=False)
+                    assistant_message.tool_calls.append(fake_call)
             for tool_call in assistant_message.tool_calls:
                 step += 1
                 trace.append(ReActTraceStep(step=step, state=state, kind="action", content={"tool_name": tool_call.function.name, "arguments": tool_call.function.arguments or "{}", "round": tool_rounds}))
@@ -255,9 +291,25 @@ class OmniAgent:
             next_response = self._call_model(allow_tools=True, extra_system=next_context)
             assistant_message = next_response.choices[0].message
             self._merge_assistant_message(assistant_message)
+            bundle = self._build_tool_bundle_from_recent_tools()
+
+        validation = validate_answer(assistant_message.content or "")
+        retries = 0
+        while not validation.ok and retries < max_answer_retries:
+            retries += 1
+            step += 1
+            trace.append(ReActTraceStep(step=step, state=AgentState.MODEL_THINKING, kind="validation_fail", content={"reason": validation.reason, "retry": retries}))
+            fix_prompt = build_fix_prompt(assistant_message.content or "", validation.reason)
+            fix_messages = list(self.messages) + [{"role": "system", "content": fix_prompt}]
+            fix_response = self.client.chat.completions.create(model=self.model_name, messages=fix_messages, temperature=0.2)
+            assistant_message = fix_response.choices[0].message
+            self._merge_assistant_message(assistant_message)
+            validation = validate_answer(assistant_message.content or "")
 
         final_answer = assistant_message.content or ""
-        final_state = AgentState.DONE if final_answer else AgentState.ERROR
+        final_state = AgentState.DONE if final_answer and validation.ok else AgentState.ERROR
+        if final_state == AgentState.ERROR:
+            final_answer = "抱歉，当前问题暂时无法自动解决，建议您联系人工客服进一步处理。"
         step += 1
         trace.append(ReActTraceStep(step=step, state=AgentState.ANSWERING, kind="final", content=final_answer))
         step += 1
