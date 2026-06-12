@@ -1,0 +1,4 @@
+{"input_text": "我的订单888到货后发现破损，想申请退款", "expected": {"intent": "refund", "product": "", "order_id": "888", "vip_level": "", "issue": "破损", "reason": "我的订单888到货后发现破损，想申请退款"}}
+{"input_text": "U1001是黄金VIP，退货规则是什么", "expected": {"intent": "return", "product": "", "order_id": "", "vip_level": "黄金VIP", "issue": "退货", "reason": "U1001是黄金VIP，退货规则是什么"}}
+{"input_text": "999号订单还在运输中，是否可以取消", "expected": {"intent": "general", "product": "", "order_id": "999", "vip_level": "", "issue": "", "reason": "999号订单还在运输中，是否可以取消"}}
+{"input_text": "发票怎么开，需要提供什么信息", "expected": {"intent": "invoice", "product": "", "order_id": "", "vip_level": "", "issue": "发票", "reason": "发票怎么开，需要提供什么信息"}}
